@@ -27,7 +27,10 @@ from vllm.models.deepseek_v41.common.engram import (
 )
 from vllm.models.deepseek_v41.quant_config import DeepseekV4FP8Config
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.utils.torch_utils import (
+    get_accelerator_view_from_cpu_tensor,
+    set_default_torch_dtype,
+)
 
 
 def _reference_engram_post_wkv(
@@ -942,6 +945,31 @@ def test_engram_use_thp_lookup_and_fallback(monkeypatch, register_fails, use_thp
     expected = torch.zeros_like(out)
     expected[:2] = 2
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_engram_huge_pages_support_bounded_host_registration(monkeypatch):
+    """Old drivers must still expose every chunk and the final partial page."""
+    limit = 64 * 1024**2
+    cudart = torch.cuda.cudart()
+    register = cudart.cudaHostRegister
+
+    def bounded_register(pointer, num_bytes, flags):
+        if num_bytes > limit:
+            return SimpleNamespace(value=1)
+        return register(pointer, num_bytes, flags)
+
+    monkeypatch.setattr(cudart, "cudaHostRegister", bounded_register)
+    storage = engram_ops._allocate_huge_page_storage(2 * limit + 17)
+    assert storage is not None and storage.is_pinned()
+    offsets = [0, limit - 1, limit, 2 * limit - 1, 2 * limit, 2 * limit + 16]
+    storage[offsets] = 73
+    view = get_accelerator_view_from_cpu_tensor(storage)
+    indices = torch.tensor(offsets, device="cuda")
+    assert torch.all(view[indices].cpu() == 73)
+    view[indices] = 91
+    torch.accelerator.synchronize()
+    assert torch.all(storage[offsets] == 91)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")

@@ -324,6 +324,13 @@ class DeepseekV41ForCausalLM(
         """Pre-hc_head residual stream buffer for the MTP/DSpark draft model."""
         return self.language_model.get_mtp_target_hidden_states()
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        parts = name.split(".", 2)
+        if len(parts) != 3 or parts[0] != "layers" or not parts[1].isdecimal():
+            return False
+        model = self.language_model.model
+        return not model.start_layer <= int(parts[1]) < model.end_layer
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(self.hf_to_vllm_mapper.apply(weights))

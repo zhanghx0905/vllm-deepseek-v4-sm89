@@ -1,0 +1,13 @@
+FROM vllm-deepseek-v4-sm89:0.33.0-vision12-sm89-sm120-cu130
+
+ENV TRITON_CACHE_DIR=/root/.cache/triton \
+    TILELANG_CACHE_DIR=/root/.cache/tilelang
+
+COPY vllm/models/deepseek_v41/common/engram.py /opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v41/common/engram.py
+COPY vllm/models/deepseek_v4_1/nvidia/model.py /opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4_1/nvidia/model.py
+COPY vllm/models/deepseek_v4_1/nvidia/vl_model.py /opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+COPY vllm/models/deepseek_v4_1/nvidia/dspark.py /opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4_1/nvidia/dspark.py
+
+LABEL local.vllm.engram-host-register="64MiB chunks for Linux 5.4 get_user_pages" \
+      local.vllm.checkpoint-cache="Preserve cache when host table allocation has 2x available RAM" \
+      local.vllm.base-revision="8e91ca5082c7c21dbdf1f03ae576fdca6c572072"

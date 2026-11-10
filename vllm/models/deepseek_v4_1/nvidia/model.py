@@ -96,6 +96,7 @@ from vllm.models.deepseek_v41.common.engram import (
 from vllm.models.deepseek_v41.nvidia.ops.mhc import hc_expand
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.cpu_resource_utils import get_available_memory
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -560,13 +561,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             engram_config.dp_shared_memory = can_share_engram_tables(self.engram_layout)
 
         if self.engram_layout is not None and engram_config and engram_config.use_thp:
-            # Release old checkpoint cache before allocating the Engram host tables.
-            model_config = vllm_config.model_config
-            drop_checkpoint_cache(
-                model_config.model_weights or model_config.model,
-                revision=model_config.revision,
-                cache_dir=vllm_config.load_config.download_dir,
+            host_table_bytes = sum(config.engram_num_embeddings) * (
+                config.engram_head_dim + config.engram_head_dim // 32
             )
+            if get_available_memory() < 2 * host_table_bytes:
+                model_config = vllm_config.model_config
+                drop_checkpoint_cache(
+                    model_config.model_weights or model_config.model,
+                    revision=model_config.revision,
+                    cache_dir=vllm_config.load_config.download_dir,
+                )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -1460,13 +1464,17 @@ class DeepseekV41LLMForCausalLM(
         self.model.finalize_mhc_broadcast_weights()
         config = self.model.vllm_config
         if config.engram_config and config.engram_config.use_thp:
-            # Loading weights refills the file cache; release it before MADV_COLLAPSE.
             model_config = config.model_config
-            drop_checkpoint_cache(
-                model_config.model_weights or model_config.model,
-                revision=model_config.revision,
-                cache_dir=config.load_config.download_dir,
+            hf_config = model_config.hf_config
+            host_table_bytes = sum(hf_config.engram_num_embeddings) * (
+                hf_config.engram_head_dim + hf_config.engram_head_dim // 32
             )
+            if get_available_memory() < 2 * host_table_bytes:
+                drop_checkpoint_cache(
+                    model_config.model_weights or model_config.model,
+                    revision=model_config.revision,
+                    cache_dir=config.load_config.download_dir,
+                )
             for layer in islice(
                 self.model.layers, self.model.start_layer, self.model.end_layer
             ):

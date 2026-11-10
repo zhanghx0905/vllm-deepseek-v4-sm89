@@ -233,3 +233,84 @@ the native path was faster, so fusion is restricted to 1–32 tokens. Native
 TF32x3 prenorm, delayed collapse, and Engram injection boundaries remain.
 Both paths were compared to FP64 equations; partial operator comparisons do
 not establish full-model output equivalence.
+
+## Two-node L40 deployment on Linux 5.4
+
+The 2026-11-10 deployment used two hosts with eight L40 GPUs and 1 TiB of
+RAM each, connected by 1 Gb Ethernet. Target TP8/PP2 keeps tensor and expert
+parallelism within each host. The native 20/20 layer partition places both
+Engram tables on the first host: its retained checkpoint shards total
+337.57 GiB, versus 148.43 GiB on the second host.
+
+The local runtime overlay can be rebuilt from the repository root:
+
+```bash
+docker build -f docker/Dockerfile.deepseek-v41-l40 \
+  -t vllm-deepseek-v4-sm89:vision12-l40-hostmem .
+```
+
+On Linux 5.4, registering an entire multi-GiB Engram table can fail in
+`get_user_pages` even with ample available RAM. The huge-page allocation
+path now registers at most 64 MiB per call, unregisters completed chunks
+on failure, and preserves the original pinned-memory fallback. Same-dtype
+CPU checkpoint copies retain every byte, including FP8 and E8M0 bit patterns,
+while avoiding an OpenMP reader pool per rank. GPU copies and dtype
+conversions retain the original loader path.
+
+With `use_thp`, checkpoint page-cache eviction is now conditional on
+available host memory being less than twice the full Engram table size.
+The existing loader callback also skips shards containing only foreign PP
+layers; mixed shards remain. The DSpark callback retains MTP, embedding and
+head shards and avoids reading unrelated backbone and Engram files.
+The overlay directs Triton and TileLang caches beneath `/root/.cache`,
+so one persistent cache volume survives container replacement.
+
+The validated serving configuration uses `--max-model-len 262144`,
+`--kv-cache-dtype fp8`, `--block-size 128`, and
+`--engram-config '{"use_thp":true}'`. It leaves `max-num-seqs`,
+`max-num-batched-tokens`, prefix caching and GPU memory utilization unset.
+This version uses extensible KV-cache sizing from memory available after
+graph capture; the older fixed 0.9 utilization description does not apply.
+The CPU distributed timeout is 7200 seconds because unequal cold-loading
+times can exceed the independent Gloo timeout.
+
+The selected DSpark options are:
+
+```json
+{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}
+```
+
+Text, arithmetic, code, tool round trips, image recognition and an
+18,933-token retrieval smoke test passed. Fixed-length serving tests used
+1024/8192/32768 input tokens and 256 generated tokens with separate cache
+salts. The 1024-token tests included 1/4/16/32 concurrent requests without
+request failures. These are short serving checks, not an accuracy evaluation
+or a sustained production load test.
+
+| 1024-token input | No speculation | DSpark, 5 draft tokens |
+| --- | ---: | ---: |
+| Single-request decode, token/s | 61.47 | 242.02 |
+| Four concurrent requests, mean decode per request, token/s | 24.22 | 98.91 |
+| 32 concurrent requests, total output including prefill, token/s | 239.88 | 274.23 |
+
+The repeated-document workload has unusually high draft acceptance.
+Additional chat-formatted asyncio coding prompts measured 175.25 token/s
+for one request and 70.31 token/s per request at four-way concurrency with
+1024-token inputs. There is no matching non-speculative coding measurement,
+so those numbers do not establish a coding speedup ratio.
+
+After retaining checkpoint cache, first-host model loading took 38–44
+seconds, versus 21–25 seconds on the second host. The preceding partially
+cold first-host load took roughly 16–22 minutes. Concurrent MinIO small-block
+I/O was observed on the same mechanical data disk; a post-load 20-second
+sample measured 66.6% disk busy with only 0.42 MiB/s reads and 3.51 MiB/s
+writes. That sample cannot attribute the entire earlier delay to MinIO.
+The colocated etcd WAL also recorded a 133.86-second `fdatasync` during
+cold model loading, followed by lease loss and Milvus exit. Checkpoint-cache
+retention reduces repeated reads but does not isolate cold-loading I/O from
+other services on the same disk.
+
+The 4096-token batch-budget experiment was interrupted before validation,
+and the final configuration retains the engine default. The 262144-token
+limit is configured and advertised, but a request reaching that limit has
+not yet been validated.

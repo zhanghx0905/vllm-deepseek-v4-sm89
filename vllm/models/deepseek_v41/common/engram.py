@@ -487,7 +487,13 @@ def _engram_head_shard_weight_loader(
     assert shard.shape == param.shape, (
         f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
     )
-    param.data.copy_(shard)
+    if param.device.type == shard.device.type == "cpu" and param.dtype == shard.dtype:
+        np.copyto(
+            param.data.view(torch.uint8).numpy(),
+            shard.view(torch.uint8).numpy(),
+        )
+    else:
+        param.data.copy_(shard)
 
 
 # Branching on SORTED at runtime intermittently crashes Triton 3.8's
@@ -852,6 +858,11 @@ def can_share_engram_tables(layout: EngramLayout, block_size: int = 32) -> bool:
     return error is None
 
 
+def _unregister_host_chunks(mapping: mmap.mmap, pointers: tuple[int, ...]) -> None:
+    for pointer in reversed(pointers):
+        DPSharedEngramStorage._unregister(mapping, pointer)
+
+
 def _allocate_huge_page_storage(num_bytes: int) -> torch.Tensor | None:
     """Register prefaulted huge pages, or return None for pinned-memory fallback."""
     if sys.platform != "linux":
@@ -870,15 +881,24 @@ def _allocate_huge_page_storage(num_bytes: int) -> torch.Tensor | None:
     owner[:: mmap.PAGESIZE] = 0
     tensor = torch.from_numpy(owner)
     pointer = tensor.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(pointer, num_bytes, 0)
-    if result.value != 0:
-        logger.warning(
-            "Engram cudaHostRegister failed (%s); using pinned memory.", result
+    # Bound get_user_pages metadata allocations on older Linux kernels.
+    chunk_bytes = 64 * 1024**2
+    pointers: list[int] = []
+    for offset in range(0, num_bytes, chunk_bytes):
+        chunk_pointer = pointer + offset
+        result = torch.cuda.cudart().cudaHostRegister(
+            chunk_pointer, min(chunk_bytes, num_bytes - offset), 0
         )
-        return None
+        if result.value != 0:
+            _unregister_host_chunks(mapping, tuple(pointers))
+            logger.warning(
+                "Engram cudaHostRegister failed (%s); using pinned memory.", result
+            )
+            return None
+        pointers.append(chunk_pointer)
     # Tensor views retain owner; its finalizer retains mapping until unregister.
     finalizer = weakref.finalize(
-        owner, DPSharedEngramStorage._unregister, mapping, pointer
+        owner, _unregister_host_chunks, mapping, tuple(pointers)
     )
     finalizer.atexit = False  # type: ignore[misc]
     if not tensor.is_pinned():
